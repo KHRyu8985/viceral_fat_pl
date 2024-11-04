@@ -351,15 +351,15 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
 
         # Save inputs as NIfTI
         inputs_nifti = nib.Nifti1Image(inputs_np, np.eye(4))
-        nib.save(inputs_nifti, self.results_folder / f'{filename_prefix}_inputs.nii.gz')
+        nib.save(inputs_nifti, save_folder / f'{filename_prefix}_inputs.nii.gz')
         
         # Save outputs as NIfTI
         outputs_nifti = nib.Nifti1Image(outputs_np, np.eye(4))
-        nib.save(outputs_nifti, self.results_folder / f'{filename_prefix}_outputs.nii.gz')
+        nib.save(outputs_nifti,save_folder / f'{filename_prefix}_outputs.nii.gz')
 
         # Save labels as NIfTI
         labels_nifti = nib.Nifti1Image(labels_np, np.eye(4))
-        nib.save(labels_nifti, self.results_folder / f'{filename_prefix}_labels.nii.gz')
+        nib.save(labels_nifti, save_folder / f'{filename_prefix}_labels.nii.gz')
 
         print(f"Results saved to: {save_folder}")
         print(f"Inputs: {save_folder / f'{filename_prefix}_inputs.nii.gz'}")
@@ -392,66 +392,62 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
         dice_score = self.dice_metric.aggregate().item()
         hausdorff_score = self.hausdorff_metric.aggregate().item()
         mean_iou_score = self.mean_iou_metric.aggregate().item()
+        filename= batch['image'].meta['filename_or_obj'][0]
+        # Extract patient ID from filename
+        patient_id = filename.split('/')[-2]  # Gets '01404213' from the path
+        d = {"test_dice": dice_score, "test_hausdorff": hausdorff_score, "test_iou": mean_iou_score, "patient_id": patient_id}
+        self.test_step_outputs.append(d)
+
         self.dice_metric.reset()
         self.hausdorff_metric.reset()
         self.mean_iou_metric.reset()
 
-        return {
-            "batch_idx": batch_idx,
-            "test_dice_score": dice_score,
-            "test_hausdorff_score": hausdorff_score,
-            "test_iou_score": mean_iou_score,
-            "test_number": len(outputs)
-        }
+        return d
 
     def on_test_epoch_end(self):
-        # Get the outputs from the test_step results
-        outputs = self.trainer.test_loop.test_step_outputs
+        # Calculate mean metrics
+        dice_scores = [x['test_dice'] for x in self.test_step_outputs]
+        hausdorff_scores = [x['test_hausdorff'] for x in self.test_step_outputs]
+        iou_scores = [x['test_iou'] for x in self.test_step_outputs]
+        
+        mean_dice = np.mean(dice_scores)
+        mean_hausdorff = np.mean(hausdorff_scores)
+        mean_iou = np.mean(iou_scores)
 
-        # Collect all scores from the test outputs
-        dice_scores = [output["test_dice_score"] for output in outputs]
-        hausdorff_scores = [output["test_hausdorff_score"] for output in outputs]
-        iou_scores = [output["test_iou_score"] for output in outputs]
+        # Save detailed results to CSV
+        results_file = self.results_folder / 'test' / 'test_results.csv'
+        with open(results_file, 'w', newline='') as csvfile:
+            fieldnames = ['dice_score', 'hausdorff_score', 'iou_score', 'patient_id']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for result in self.test_step_outputs:
+                # Create a new dict without the filename
+                result_with_filename = {
+                    'dice_score': result['test_dice'],
+                    'hausdorff_score': result['test_hausdorff'],
+                    'iou_score': result['test_iou'],
+                    'patient_id': result['patient_id']
+                }
+                writer.writerow(result_with_filename)
+        # Write summary row at the end of test results
+        with open(results_file, 'a', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writerow({
+                'dice_score': f"{mean_dice:.4f} ± {np.std(dice_scores):.4f}",
+                'hausdorff_score': f"{mean_hausdorff:.4f} ± {np.std(hausdorff_scores):.4f}",
+                'iou_score': f"{mean_iou:.4f} ± {np.std(iou_scores):.4f}",
+                'patient_id': f"AVG ± STD"
+            })
 
-        # Calculate statistics
-        mean_test_dice = torch.mean(torch.tensor(dice_scores))
-        std_test_dice = torch.std(torch.tensor(dice_scores))
-        mean_test_hausdorff = torch.mean(torch.tensor(hausdorff_scores))
-        std_test_hausdorff = torch.std(torch.tensor(hausdorff_scores))
-        mean_test_iou = torch.mean(torch.tensor(iou_scores))
-        std_test_iou = torch.std(torch.tensor(iou_scores))
-
-        # Print and return the statistics
-        print(f"Final test mean dice: {mean_test_dice:.4f}")
-        print(f"Final test std dice: {std_test_dice:.4f}")
-        print(f"Final test mean hausdorff: {mean_test_hausdorff:.4f}")
-        print(f"Final test std hausdorff: {std_test_hausdorff:.4f}")
-        print(f"Final test mean iou: {mean_test_iou:.4f}")
-        print(f"Final test std iou: {std_test_iou:.4f}")
-
-        # Save results to CSV
-        csv_file = self.results_folder / 'test_results.csv'
-        with open(csv_file, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(["Subject Index", "Dice Score", "Hausdorff Score", "IoU Score"])
-
-            for output in outputs:
-                writer.writerow([output["batch_idx"], output["test_dice_score"], output["test_hausdorff_score"], output["test_iou_score"]])
-
-            writer.writerow([])
-            writer.writerow(["Mean", mean_test_dice.item(), mean_test_hausdorff.item(), mean_test_iou.item()])
-            writer.writerow(["Std", std_test_dice.item(), std_test_hausdorff.item(), std_test_iou.item()])
-
-        print(f"Test results saved to: {csv_file}")
-
-        final_dict = {
-            "test_dice_mean": mean_test_dice,
-            "test_dice_std": std_test_dice,
-            "test_hausdorff_mean": mean_test_hausdorff,
-            "test_hausdorff_std": std_test_hausdorff,
-            "test_iou_mean": mean_test_iou,
-            "test_iou_std": std_test_iou,
-        }
+        print(f"\nTest Results Summary:")
+        print(f"Mean Dice Score: {mean_dice:.4f}")
+        print(f"Mean Hausdorff Distance: {mean_hausdorff:.4f}")
+        print(f"Mean IoU Score: {mean_iou:.4f}")
+        print(f"Detailed results saved to: {results_file}")
+        
+        # Clear the outputs
+        self.test_step_outputs.clear()
     
     
 @click.command()
