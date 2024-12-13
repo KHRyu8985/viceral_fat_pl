@@ -14,15 +14,19 @@ from monai.transforms import (
     Compose,
     Spacingd,
     EnsureType,
-    AsDiscrete
+    AsDiscrete,
 )
 from monai.networks.nets import AttentionUnet, SegResNet, UNETR, SwinUNETR, VNet
 from monai.networks.nets import UNet
 from monai.networks.layers import Norm
-from lightning.pytorch.callbacks import BatchSizeFinder, LearningRateFinder, StochasticWeightAveraging
+from lightning.pytorch.callbacks import (
+    BatchSizeFinder,
+    LearningRateFinder,
+    StochasticWeightAveraging,
+)
 
 from monai.metrics import DiceMetric, HausdorffDistanceMetric, MeanIoU
-from monai.losses import DiceLoss
+from monai.losses import DiceLoss, DiceFocalLoss, DiceCELoss  # Add DiceCELoss import
 from monai.inferers import sliding_window_inference
 from monai.data import CacheDataset, list_data_collate, decollate_batch, DataLoader
 from monai.config import print_config
@@ -43,6 +47,7 @@ from dvclive.lightning import DVCLiveLogger
 
 print_config()
 
+
 def load_data_splits(yaml_path, fold_number=1):
     # Read the YAML file
     with open(yaml_path, "r") as file:
@@ -50,7 +55,7 @@ def load_data_splits(yaml_path, fold_number=1):
 
     # Extract train, val, test splits from the specified fold
     fold_key = f"fold_{fold_number}"
-    fold = data["cross_validation_splits"][0][fold_key]
+    fold = data["cross_validation_splits"][fold_number-1][fold_key]
     train_split = fold["train"]
     val_split = fold["val"]
     test_split = fold["test"]
@@ -86,14 +91,23 @@ def load_data_splits(yaml_path, fold_number=1):
     return train_split, val_split, test_split
 
 
-
 class FatSegmentModel(pytorch_lightning.LightningModule):
     """Unguided model for comparison"""
 
-    def __init__(self, arch_name='UNETR',batch_size=1, lr=1e-3, patch_size=(96, 96, 96)):
+    def __init__(
+        self,
+        arch_name="UNETR",
+        loss_fn="DiceFocalLoss",
+        batch_size=1,
+        lr=1e-3,
+        patch_size=(96, 96, 96),
+        fold_number=1,
+    ):
         super().__init__()
-        
-        if arch_name == 'UNet':
+
+        self.fold_number = fold_number  # Store the fold number
+
+        if arch_name == "UNet":
             self._model = UNet(
                 spatial_dims=3,
                 in_channels=1,
@@ -103,7 +117,7 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
                 num_res_units=2,
                 norm=Norm.BATCH,
             )
-        elif arch_name == 'AttentionUnet':
+        elif arch_name == "AttentionUnet":
             self._model = AttentionUnet(
                 spatial_dims=3,
                 in_channels=1,
@@ -112,7 +126,7 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
                 strides=(2, 2, 2, 2),
                 dropout=0.1,
             )
-        elif arch_name == 'SegResNet':
+        elif arch_name == "SegResNet":
             self._model = SegResNet(
                 spatial_dims=3,
                 in_channels=1,
@@ -122,14 +136,11 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
                 blocks_up=(1, 1, 1),
                 dropout_prob=0.2,
             )
-        elif arch_name == 'UNETR':
+        elif arch_name == "UNETR":
             self._model = UNETR(
-                in_channels=1,
-                out_channels=2,
-                img_size=patch_size,
-                feature_size=16
+                in_channels=1, out_channels=2, img_size=patch_size, feature_size=16
             )
-        elif arch_name == 'SwinUNETR':
+        elif arch_name == "SwinUNETR":
             self._model = SwinUNETR(
                 img_size=patch_size,
                 in_channels=1,
@@ -140,19 +151,27 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
             weight = torch.load("weights/model_swinvit.pt", weights_only=True)
             self._model.load_from(weight)
             print("Using pretrained self-supervised Swin UNETR backbone weights!")
-            
-        elif arch_name == 'VNet':
+
+        elif arch_name == "VNet":
             self._model = VNet(
                 spatial_dims=3,
                 in_channels=1,
                 out_channels=2,
-                act='relu',
+                act="relu",
                 dropout_prob=0.5,
             )
         else:
             raise ValueError(f"Unsupported architecture name: {arch_name}")
-        
-        self.loss_function = DiceLoss(to_onehot_y=True, softmax=True)
+
+        if loss_fn == "DiceLoss":
+            self.loss_function = DiceLoss(to_onehot_y=True, softmax=True)
+        elif loss_fn == "DiceCELoss":
+            self.loss_function = DiceCELoss(to_onehot_y=True, softmax=True)
+        elif loss_fn == "DiceFocalLoss":
+            self.loss_function = DiceFocalLoss(to_onehot_y=True, softmax=True)
+        else:
+            raise ValueError(f"Unsupported loss function: {loss_fn}")
+
         self.post_pred = Compose(
             [EnsureType("tensor", device="cpu"), AsDiscrete(argmax=True, to_onehot=2)]
         )
@@ -162,7 +181,9 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
         self.dice_metric = DiceMetric(
             include_background=False, reduction="mean", get_not_nans=False
         )
-        self.hausdorff_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
+        self.hausdorff_metric = HausdorffDistanceMetric(
+            include_background=False, percentile=95, reduction="mean"
+        )
         self.mean_iou_metric = MeanIoU(include_background=False, reduction="mean")
         self.best_val_dice = 0
         self.best_val_epoch = 0
@@ -178,7 +199,9 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
 
     def prepare_data(self):
         # set up the correct data path
-        train_files, val_files, test_files = load_data_splits(yaml_path='data/KU-PET-CT/data_splits.yaml')
+        train_files, val_files, test_files = load_data_splits(
+            yaml_path="data/KU-PET-CT/data_splits.yaml", fold_number=self.fold_number
+        )
 
         set_determinism(seed=0)
 
@@ -188,11 +211,11 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
                 LoadImaged(keys=["image", "label"]),
                 EnsureChannelFirstd(keys=["image", "label"]),
                 Orientationd(keys=["image", "label"], axcodes="RAS"),
-                Spacingd(
-                    keys=["image", "label"],
-                    pixdim=(1.5, 1.5, 2.0),
-                    mode=("bilinear", "nearest"),
-                ),
+                # Spacingd(
+                #    keys=["image", "label"],
+                #    pixdim=(1.5, 1.5, 2.0),
+                #    mode=("bilinear", "nearest"),
+                # ),
                 ScaleIntensityRanged(
                     keys=["image"],
                     a_min=-200,
@@ -201,16 +224,14 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
                     b_max=1.0,
                     clip=True,
                 ),
-                CropForegroundd(
-                    keys=["image", "label"], source_key="image"
-                ),
+                CropForegroundd(keys=["image", "label"], source_key="image"),
                 RandCropByPosNegLabeld(
                     keys=["image", "label"],
                     label_key="label",
                     spatial_size=self.patch_size,
                     pos=1,
                     neg=1,
-                    num_samples=4,
+                    num_samples=6,
                     image_key="image",
                     image_threshold=0,
                 ),
@@ -229,32 +250,32 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
         )
 
         val_transforms = Compose(
-        [
-            LoadImaged(keys=["image", "label"]),
-            EnsureChannelFirstd(keys=["image", "label"]),
-            Orientationd(keys=["image", "label"], axcodes="RAS"),
-            Spacingd(
-                keys=["image", "label"],
-                pixdim=(1.5, 1.5, 2.0),
-                mode=("bilinear", "nearest"),
-            ),
-            ScaleIntensityRanged(
-                keys=["image"],
-                a_min=-200,
-                a_max=100,
-                b_min=0.0,
-                b_max=1.0,
-                clip=True,
-            ),
-            CropForegroundd(keys=["image", "label"], source_key="image"),
-        ]
-    )
+            [
+                LoadImaged(keys=["image", "label"]),
+                EnsureChannelFirstd(keys=["image", "label"]),
+                Orientationd(keys=["image", "label"], axcodes="RAS"),
+                # Spacingd(
+                #    keys=["image", "label"],
+                #    pixdim=(1.5, 1.5, 2.0),
+                #    mode=("bilinear", "nearest"),
+                # ),
+                ScaleIntensityRanged(
+                    keys=["image"],
+                    a_min=-200,
+                    a_max=100,
+                    b_min=0.0,
+                    b_max=1.0,
+                    clip=True,
+                ),
+                CropForegroundd(keys=["image", "label"], source_key="image"),
+            ]
+        )
 
         # we use cached datasets - these are 10x faster than regular datasets
         self.train_ds = CacheDataset(
             data=train_files,
             transform=train_transforms,
-            cache_rate=0.3,
+            cache_rate=0.1,
             num_workers=4,
         )
         self.val_ds = CacheDataset(
@@ -263,7 +284,7 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
             cache_rate=0.1,
             num_workers=4,
         )
-        
+
         self.test_ds = CacheDataset(
             data=test_files,
             transform=val_transforms,
@@ -273,21 +294,18 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
 
     def train_dataloader(self):
         train_loader = DataLoader(
-            self.train_ds,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=4
+            self.train_ds, batch_size=self.batch_size, shuffle=True, num_workers=4
         )
         return train_loader
 
     def val_dataloader(self):
         val_loader = DataLoader(self.val_ds, batch_size=1, num_workers=4)
         return val_loader
-    
+
     def test_dataloader(self):
         test_loader = DataLoader(self.test_ds, batch_size=1, num_workers=4)
         return test_loader
-    
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self._model.parameters(), self.lr)
         return optimizer
@@ -297,7 +315,14 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
         output = self.forward(images)
         loss = self.loss_function(output, labels)
         metrics = loss.item()
-        self.log("train_loss", metrics, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log(
+            "train_loss",
+            metrics,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -337,7 +362,7 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
         }
 
         self.log_dict(log_dict)
-        
+
         if mean_val_dice > self.best_val_dice:
             self.best_val_dice = mean_val_dice
             self.best_val_epoch = self.current_epoch
@@ -352,31 +377,40 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
         )
         self.validation_step_outputs.clear()  # free memory
 
-    def save_results(self, inputs, outputs, labels, filename_prefix='results'):
+    def save_results(self, inputs, outputs, labels, filename_prefix="results"):
         # Ensure outputs and labels are numpy arrays
         # Create the test results folder if it doesn't exist
-        save_folder = self.results_folder / 'test'
+        save_folder = self.results_folder / "test"
         os.makedirs(save_folder, exist_ok=True)
-        
+
         inputs_np = inputs.detach().cpu().numpy().squeeze()
-        outputs_np = outputs.detach().cpu().numpy().squeeze()[1] 
+        outputs_np = outputs.detach().cpu().numpy().squeeze()[1]
         labels_np = labels.detach().cpu().numpy().squeeze()[1]
-        
-        inputs_np = np.moveaxis(inputs_np, 0, -1)
-        outputs_np = np.moveaxis(outputs_np, 0, -1)
-        labels_np = np.moveaxis(labels_np, 0, -1)
+
+        # inputs_np = np.moveaxis(inputs_np, 0, -1)
+        # outputs_np = np.moveaxis(outputs_np, 0, -1)
+        # labels_np = np.moveaxis(labels_np, 0, -1)
 
         # Save inputs as NIfTI
-        inputs_nifti = nib.Nifti1Image(inputs_np, np.eye(4))
-        nib.save(inputs_nifti, save_folder / f'{filename_prefix}_inputs.nii.gz')
-        
+        inputs_nifti = nib.Nifti1Image(
+            inputs_np,
+            np.array([[0.98, 0, 0, 0], [0, 0.98, 0, 0], [0, 0, 2.8, 0], [0, 0, 0, 1]]),
+        )
+        nib.save(inputs_nifti, save_folder / f"{filename_prefix}_inputs.nii.gz")
+
         # Save outputs as NIfTI
-        outputs_nifti = nib.Nifti1Image(outputs_np, np.eye(4))
-        nib.save(outputs_nifti, save_folder / f'{filename_prefix}_outputs.nii.gz')
+        outputs_nifti = nib.Nifti1Image(
+            outputs_np,
+            np.array([[0.98, 0, 0, 0], [0, 0.98, 0, 0], [0, 0, 2.8, 0], [0, 0, 0, 1]]),
+        )
+        nib.save(outputs_nifti, save_folder / f"{filename_prefix}_outputs.nii.gz")
 
         # Save labels as NIfTI
-        labels_nifti = nib.Nifti1Image(labels_np, np.eye(4))
-        nib.save(labels_nifti, save_folder / f'{filename_prefix}_labels.nii.gz')
+        labels_nifti = nib.Nifti1Image(
+            labels_np,
+            np.array([[0.98, 0, 0, 0], [0, 0.98, 0, 0], [0, 0, 2.8, 0], [0, 0, 0, 1]]),
+        )
+        nib.save(labels_nifti, save_folder / f"{filename_prefix}_labels.nii.gz")
 
         print(f"Results saved to: {save_folder}")
         print(f"Inputs: {save_folder / f'{filename_prefix}_inputs.nii.gz'}")
@@ -393,9 +427,13 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
         outputs = [self.post_pred(i) for i in decollate_batch(outputs)]
         labels = [self.post_label(i) for i in decollate_batch(labels)]
         
+        filename = batch["image"].meta["filename_or_obj"][0]
+        patient_id = filename.split("/")[-2]  # Gets '01404213' from the path
         # Save results
-        self.save_results(images, outputs[0], labels[0], filename_prefix=f'batch_{batch_idx}')
-        
+        self.save_results(
+            images, outputs[0], labels[0], filename_prefix=f"Subj_{patient_id}"
+        )
+
         self.dice_metric(y_pred=outputs, y=labels)
         self.hausdorff_metric(y_pred=outputs, y=labels)
         self.mean_iou_metric(y_pred=outputs, y=labels)
@@ -404,117 +442,132 @@ class FatSegmentModel(pytorch_lightning.LightningModule):
         dice_score = self.dice_metric.aggregate().item()
         hausdorff_score = self.hausdorff_metric.aggregate().item()
         mean_iou_score = self.mean_iou_metric.aggregate().item()
-        filename= batch['image'].meta['filename_or_obj'][0]
-        # Extract patient ID from filename
-        patient_id = filename.split('/')[-2]  # Gets '01404213' from the path
-        
-        d = {"test_dice": dice_score, "test_hausdorff": hausdorff_score, "test_iou": mean_iou_score, "patient_id": patient_id}
+
+
+        d = {
+            "test_dice": dice_score,
+            "test_hausdorff": hausdorff_score,
+            "test_iou": mean_iou_score,
+            "patient_id": patient_id,
+        }
         self.test_step_outputs.append(d)
 
-        self.log_dict({k:v for k,v in d.items() if not isinstance(v, str)}, on_step=True, prog_bar=True)
-        
         # Reset metrics for next example
         self.dice_metric.reset()
         self.hausdorff_metric.reset()
-        self.iou_metric.reset()
-    
+        self.mean_iou_metric.reset()
+
         return d
 
     def on_test_epoch_end(self):
         # Calculate mean metrics
-        dice_scores = [x['test_dice'] for x in self.test_step_outputs]
-        hausdorff_scores = [x['test_hausdorff'] for x in self.test_step_outputs]
-        iou_scores = [x['test_iou'] for x in self.test_step_outputs]
-        
+        dice_scores = [x["test_dice"] for x in self.test_step_outputs]
+        hausdorff_scores = [x["test_hausdorff"] for x in self.test_step_outputs]
+        iou_scores = [x["test_iou"] for x in self.test_step_outputs]
+
         mean_dice = np.mean(dice_scores)
         mean_hausdorff = np.mean(hausdorff_scores)
         mean_iou = np.mean(iou_scores)
-        
+
         # Log mean metrics
-        self.log_dict({
-            'test/mean_dice': mean_dice,
-            'test/mean_hausdorff': mean_hausdorff,
-            'test/mean_iou': mean_iou
-        })
-        
+        self.log_dict(
+            {
+                "test/mean_dice": mean_dice,
+                "test/mean_hausdorff": mean_hausdorff,
+                "test/mean_iou": mean_iou,
+            }
+        )
+
         # Save detailed results to CSV
-        results_file = self.results_folder / 'test' / 'test_results.csv'
-        with open(results_file, 'w', newline='') as csvfile:
-            fieldnames = ['dice_score', 'hausdorff_score', 'iou_score', 'patient_id']
+        results_file = self.results_folder / "test" / "test_results.csv"
+        with open(results_file, "w", newline="") as csvfile:
+            fieldnames = ["dice_score", "hausdorff_score", "iou_score", "patient_id"]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
+
             writer.writeheader()
             for result in self.test_step_outputs:
                 # Create a new dict without the filename
                 result_with_filename = {
-                    'dice_score': result['test_dice'],
-                    'hausdorff_score': result['test_hausdorff'],
-                    'iou_score': result['test_iou'],
-                    'patient_id': result['patient_id']
+                    "dice_score": result["test_dice"],
+                    "hausdorff_score": result["test_hausdorff"],
+                    "iou_score": result["test_iou"],
+                    "patient_id": result["patient_id"],
                 }
                 writer.writerow(result_with_filename)
         # Write summary row at the end of test results
-        with open(results_file, 'a', newline='') as csvfile:
+        with open(results_file, "a", newline="") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writerow({
-                'dice_score': f"{mean_dice:.4f} ± {np.std(dice_scores):.4f}",
-                'hausdorff_score': f"{mean_hausdorff:.4f} ± {np.std(hausdorff_scores):.4f}",
-                'iou_score': f"{mean_iou:.4f} ± {np.std(iou_scores):.4f}",
-                'patient_id': f"AVG ± STD"
-            })
+            writer.writerow(
+                {
+                    "dice_score": f"{mean_dice:.4f} ± {np.std(dice_scores):.4f}",
+                    "hausdorff_score": f"{mean_hausdorff:.4f} ± {np.std(hausdorff_scores):.4f}",
+                    "iou_score": f"{mean_iou:.4f} ± {np.std(iou_scores):.4f}",
+                    "patient_id": f"AVG ± STD",
+                }
+            )
 
         print(f"\nTest Results Summary:")
         print(f"Mean Dice Score: {mean_dice:.4f}")
         print(f"Mean Hausdorff Distance: {mean_hausdorff:.4f}")
         print(f"Mean IoU Score: {mean_iou:.4f}")
         print(f"Detailed results saved to: {results_file}")
-        
+
         # Clear the outputs
         self.test_step_outputs.clear()
-    
+
+
 @click.command()
 @click.option(
-    '--arch_name',
-    type=click.Choice(['UNet', 'AttentionUnet', 'SegResNet', 'UNETR', 'SwinUNETR', 'VNet']),
-    default='UNETR',
-    help='Choose the architecture name for the model.'
+    "--arch_name",
+    type=click.Choice(
+        ["UNet", "AttentionUnet", "SegResNet", "UNETR", "SwinUNETR", "VNet"]
+    ),
+    default="UNETR",
+    help="Choose the architecture name for the model.",
 )
 @click.option(
-    '--max_epochs',
+    "--loss_fn",
+    type=click.Choice(["DiceLoss", "DiceCELoss", "DiceFocalLoss"]),
+    default="DiceFocalLoss",
+    help="Choose the loss function for training.",
+)
+@click.option(
+    "--max_epochs",
     type=int,
     default=300,
-    help='Set the maximum number of training epochs.'
+    help="Set the maximum number of training epochs.",
 )
 @click.option(
-    '--check_val_every_n_epoch',
+    "--check_val_every_n_epoch",
     type=int,
     default=10,
-    help='Set the frequency of validation checks (in epochs).'
+    help="Set the frequency of validation checks (in epochs).",
 )
 @click.option(
-    '--gpu_number',
-    type=int,
-    default=0,
-    help='Set the GPU index to use for training.'
+    "--gpu_number", type=int, default=0, help="Set the GPU index to use for training."
 )
 @click.option(
-    '--checkpoint_path',
+    "--checkpoint_path",
     type=str,
     default=None,
-    help='Path to a checkpoint file to load for inference.'
+    help="Path to a checkpoint file to load for inference.",
 )
-def main(arch_name, max_epochs, check_val_every_n_epoch, gpu_number, checkpoint_path):
+@click.option("--fold_number", type=int, default=4, help="Specify the fold number for training.")
+def main(arch_name, loss_fn, max_epochs, check_val_every_n_epoch, gpu_number, checkpoint_path, fold_number):
     # set up loggers and checkpoints
-    log_dir = f"results/{arch_name}"
+    log_dir = f"results/conven_{arch_name}_{fold_number}"
     os.makedirs(log_dir, exist_ok=True)
-    
 
     # Create a list with a single GPU index
     devices = [gpu_number]
 
     # Set up callbacks
-    callbacks = [StochasticWeightAveraging(swa_lrs=[1e-4], annealing_epochs=5, swa_epoch_start=100)]
-    dvc_logger = DVCLiveLogger(log_model=True, dir=log_dir, report='html')
+    callbacks = [
+        StochasticWeightAveraging(
+            swa_lrs=[1e-4], annealing_epochs=5, swa_epoch_start=100
+        )
+    ]
+    dvc_logger = DVCLiveLogger(log_model=True, dir=log_dir, report="html")
 
     # initialise Lightning's trainer.
     trainer = pytorch_lightning.Trainer(
@@ -528,19 +581,21 @@ def main(arch_name, max_epochs, check_val_every_n_epoch, gpu_number, checkpoint_
         check_val_every_n_epoch=check_val_every_n_epoch,
         num_sanity_val_steps=1,
         callbacks=callbacks,
-        default_root_dir=log_dir
+        default_root_dir=log_dir,
     )
 
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
         # Load model from checkpoint and perform inference
-        net = FatSegmentModel.load_from_checkpoint(checkpoint_path, arch_name=arch_name)
+        print(f"Loading checkpoint from {checkpoint_path}")
+        net = FatSegmentModel.load_from_checkpoint(checkpoint_path, arch_name=arch_name, loss_fn=loss_fn)
         net.results_folder = Path(log_dir)  # Set results folder path
 
         net.prepare_data()
+        print(f"Inferring and testing model")
         trainer.test(model=net, dataloaders=net.test_dataloader())
     else:
         # Initialize model for training
-        net = FatSegmentModel(arch_name=arch_name, batch_size=1)
+        net = FatSegmentModel(arch_name=arch_name, loss_fn=loss_fn, batch_size=1, fold_number=fold_number)
         net.results_folder = Path(log_dir)  # Set results folder path
 
         # Train the model
@@ -548,6 +603,6 @@ def main(arch_name, max_epochs, check_val_every_n_epoch, gpu_number, checkpoint_
         trainer.save_checkpoint(os.path.join(log_dir, "final_model.ckpt"))
         trainer.test(model=net, dataloaders=net.test_dataloader())
 
+
 if __name__ == "__main__":
     main()
-
