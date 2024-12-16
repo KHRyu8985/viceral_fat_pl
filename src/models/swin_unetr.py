@@ -36,6 +36,8 @@ class ModifiedUnetrUpBlock(nn.Module):
         self.spa_de = SPADE(out_channels, label_nc=label_nc)  # Adjust label_nc as needed
         self.upconv = nn.ConvTranspose3d(in_channels, out_channels, kernel_size=2, stride=2)
         self.conv = nn.Conv3d(out_channels * 2, out_channels, kernel_size=3, stride=1, padding=1)
+        self.norm = nn.InstanceNorm3d(out_channels),
+
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x, skip, segmap):
@@ -46,7 +48,9 @@ class ModifiedUnetrUpBlock(nn.Module):
             x = self.spa_de(x, segmap)
 
         x = self.conv(x)        
+        x = self.norm(x)
         x = self.relu(x)
+        
         return x
 
 class SwinUNETRv2(nn.Module):
@@ -193,6 +197,48 @@ class SwinUNETRv2(nn.Module):
         dec1 = self.decoder3(dec2, enc2, segmap)
         
         # Do not apply segmap in decoder2 and decoder1
+        dec0 = self.decoder2(dec1, enc1, None)
+        out = self.decoder1(dec0, enc0, None)
+        
+        logits = self.out(out)
+        return logits
+    
+class SPADESwinUNETR(SwinUNETRv2):
+    """
+    SwinUNETR variant with SPADE normalization in both encoder and decoder paths.
+    """
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # Add SPADE to encoder blocks
+        self.spade_enc1 = SPADE(self.feature_size, kwargs.get('label_nc', 1))
+        self.spade_enc2 = SPADE(self.feature_size, kwargs.get('label_nc', 1))
+        self.spade_enc3 = SPADE(2 * self.feature_size, kwargs.get('label_nc', 1))
+        self.spade_enc4 = SPADE(4 * self.feature_size, kwargs.get('label_nc', 1))
+
+    def forward(self, x_in, segmap):
+        hidden_states_out = self.swinViT(x_in)
+        
+        # Apply SPADE in encoder path
+        enc0 = self.encoder1(x_in)
+        enc0 = self.spade_enc1(enc0, segmap)
+        
+        enc1 = self.encoder2(hidden_states_out[0])
+        enc1 = self.spade_enc2(enc1, segmap)
+        
+        enc2 = self.encoder3(hidden_states_out[1])
+        enc2 = self.spade_enc3(enc2, segmap)
+        
+        enc3 = self.encoder4(hidden_states_out[2])
+        enc3 = self.spade_enc4(enc3, segmap)
+        
+        dec4 = self.encoder10(hidden_states_out[4])
+        
+        # Apply SPADE in decoder path as before
+        dec3 = self.decoder5(dec4, hidden_states_out[3], segmap)
+        dec2 = self.decoder4(dec3, enc3, segmap)
+        dec1 = self.decoder3(dec2, enc2, segmap)
         dec0 = self.decoder2(dec1, enc1, None)
         out = self.decoder1(dec0, enc0, None)
         
