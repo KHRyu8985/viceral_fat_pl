@@ -1,0 +1,45 @@
+metrics:
+- results/conven_SegResNet_1/metrics.json
+- results/conven_UNETR_3/metrics.json
+- results/conven_UNETR_4/metrics.json
+- results/conven_UNETR_1/metrics.json
+- results/conven_SwinUNETR_5/metrics.json
+- results/residual_SegResNet_1/metrics.json
+- results/conven_SwinUNETR_1/metrics.json
+- results/proposed_SegResNet_3/metrics.json
+- results/proposed_SegResNet_5/metrics.json
+- results/conven_SwinUNETR_3/metrics.json
+- results/conven_UNETR_2/metrics.json
+- results/conven_SwinUNETR_4/metrics.json
+- results/conven_SwinUNETR_2/metrics.json
+plots:
+- results/conven_SegResNet_1/plots/metrics:
+    x: step
+- results/conven_UNETR_3/plots/metrics:
+    x: step
+- results/conven_UNETR_4/plots/metrics:
+    x: step
+- results/conven_UNETR_1/plots/metrics:
+    x: step
+- results/conven_SwinUNETR_5/plots/metrics:
+    x: step
+- results/residual_SegResNet_1/plots/metrics:
+    x: step
+- results/conven_SwinUNETR_1/plots/metrics:
+    x: step
+- results/proposed_SegResNet_3/plots/metrics:
+    x: step
+- results/proposed_SegResNet_5/plots/metrics:
+    x: step
+- results/conven_SwinUNETR_3/plots/metrics:
+    x: step
+- results/conven_UNETR_2/plots/metrics:
+    x: step
+- results/conven_SwinUNETR_4/plots/metrics:
+    x: step
+- results/conven_SwinUNETR_2/plots/metrics:
+    x: step
+artifacts:
+  best:
+    path: results/proposed_SegResNet_5/artifacts/epoch=299-step=6600.ckpt
+    type: model
