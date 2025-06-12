@@ -23,3 +23,16 @@
 *.h5
 *.pyc
 *.ckpt
+results/*
+data/*
+*dvc
+*cursor
+
+# Keep folder structure
+!**/.gitkeep
+!data/.gitkeep
+!results/.gitkeep
+
+# Exclude specific data folders
+data/KU-PET-CT/
+data/KU-PET-CT2/
